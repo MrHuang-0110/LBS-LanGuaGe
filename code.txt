@@ -1,0 +1,229 @@
+#include "asr.h"
+extern "C"{ void * __dso_handle = 0 ;}
+#include "setup.h"
+#include "HardwareSerial.h"
+#include "myLib/asr_event.h"
+
+uint32_t snid;
+void app();
+void ASR_CODE();
+
+//{speak:小蝶-清新女声,vol:10,speed:10,platform:haohaodada}
+//{playid:10001,voice:}
+//{playid:10002,voice:}
+
+//{ID:10250,keyword:"命令词",ASR:"最大音量",ASRTO:"音量调整到最大"}
+//{ID:10251,keyword:"命令词",ASR:"中等音量",ASRTO:"音量调整到中等"}
+//{ID:10252,keyword:"命令词",ASR:"最小音量",ASRTO:"音量调整到最小"}
+// 记录当前播报的 ID (用于 done 回调)
+static volatile uint8_t g_playing_id = 0;
+
+// 播报完成回调 → 发送 done=<id>\r\n
+static void on_play_done(uint16_t play_id) {
+  uint8_t pid = g_playing_id;
+  if (pid > 0) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "done=%u\r\n", pid);
+    Serial1.print(buf);
+    g_playing_id = 0;
+  }
+}
+
+// 剥掉尾部空白/CR/LF
+static void trim_frame(String &s) {
+  while (s.length() > 0) {
+    char c = s.charAt(s.length() - 1);
+    if (c == '\r' || c == '\n' || c == ' ' || c == '\t')
+      s.remove(s.length() - 1);
+    else
+      break;
+  }
+}
+
+// 解析 "prefix<dec>",返回数值 (0-255) 或 -1
+static int parse_num(const String &s, const char *prefix) {
+  int plen = strlen(prefix);
+  if (!s.startsWith(prefix)) return -1;
+  if ((int)s.length() <= plen) return -1;
+  int val = 0;
+  for (int i = plen; i < (int)s.length(); i++) {
+    char c = s.charAt(i);
+    if (c < '0' || c > '9') return -1;
+    val = val * 10 + (c - '0');
+    if (val > 255) return -1;
+  }
+  return val;
+}
+
+// UART 接收任务 - 按 \n 精确分帧
+// 协议 v0.9: MCU → ASR  play=<id>\n / stop\n / ping\n / wakeup=<sec>\n / sleep\n
+//            ASR → MCU  cmd=<id>\r\n / wake\r\n / sleep\r\n / done=<id>\r\n
+void app(){
+  while (1) {
+    if (Serial1.available() > 0) {
+      String frame = Serial1.readStringUntil('\n');
+      trim_frame(frame);
+
+      // 空帧 / 超长丢弃
+      if (frame.length() == 0 || frame.length() > 30) {
+        continue;
+      }
+
+      // ---- play=<id> ----  id 范围 17-63
+      int pid = parse_num(frame, "play=");
+      if (pid >= 0) {
+        if (pid < 17 || pid > 63) continue;  // 越界丢弃
+        g_playing_id = (uint8_t)pid;
+        // playid 直接就是协议 ID (编程模式录音时按此表配置)
+        prompt_play_by_voice_id((uint16_t)pid, on_play_done, true);
+        continue;
+      }
+
+      // ---- stop ----
+      if (frame == "stop") {
+        g_playing_id = 0;
+        prompt_stop_play();
+        continue;
+      }
+
+      // ---- ping ----
+      if (frame == "ping") {
+        // 协议未定义响应,静默
+        continue;
+      }
+
+      // ---- wakeup=<sec> ---- v0.9 主控主动请求进入唤醒 (sec 秒后自动休眠)
+      // 编程模式"等待词条"期间由主控下发/续期: 进入唤醒态并切到命令词模型组,
+      // 使用户不必先说唤醒词就能说出 ASR_01..ASR_10 (42-51)。
+      int wsec = parse_num(frame, "wakeup=");
+      if (wsec >= 0) {
+        if (wsec < 1) continue;                  // 0 秒无意义,丢弃
+        enter_wakeup((uint32_t)wsec * 1000U);    // asr.h 宏: enter_wakeup_deal(ms,INVALID_HANDLE)
+        continue;
+      }
+
+      // ---- sleep ---- v0.9 主控主动请求立即退出唤醒
+      // 词条命中/程序取消后由主控下发: 切回唤醒词模型并触发 sys_sleep_hook → sleep\r\n。
+      // 0 = 不等 ASR 空闲,立即退出; 已休眠时 SDK 内部早退,幂等。
+      if (frame == "sleep") {
+        exit_wakeup_deal(0);
+        continue;
+      }
+
+      // 未识别 - 静默忽略
+    }
+    delay(2);
+  }
+  vTaskDelete(NULL);
+}
+
+// 休眠钩子：进入休眠前立即上报 sleep，主控据此熄灭呼吸灯
+void sys_sleep_hook() {
+  Serial1.print("sleep\r\n");
+}
+
+// ============================================================
+// ASR_CODE - 识别成功钩子
+// snid = 编程模式给命令词填的 ID
+//   snid==0        → 唤醒词,发 wake\r\n
+//   1-16 / 42-51   → 命令词,发 cmd=<snid>\r\n
+// ============================================================
+void ASR_CODE(){
+  set_state_enter_wakeup(15000);  // 15秒无指令进入休眠
+
+  if (snid == 0) {
+    Serial1.print("wake\r\n");
+  } else if ((snid >= 1 && snid <= 16) || (snid >= 42 && snid <= 51)) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "cmd=%u\r\n", (unsigned)snid);
+    Serial1.print(buf);
+  }
+  // 越界的 snid 静默丢弃
+}
+
+void hardware_init(){
+  vol_set(7);
+  setPinFun(2,FORTH_FUNCTION);
+  setPinFun(3,FORTH_FUNCTION);
+  Serial1.begin(9600);
+  Serial1.flush();
+  xTaskCreate(app,"app",512,NULL,4,NULL);
+  vTaskDelete(NULL);
+}
+
+
+
+void setup()
+{
+  //{ID:0,keyword:"唤醒词",ASR:"小白小白",ASRTO:"我在"}
+  //{ID:1,keyword:"命令词",ASR:"关机",ASRTO:"关机"}
+  //{ID:2,keyword:"命令词",ASR:"动力模式",ASRTO:"动力模式"}
+  //{ID:3,keyword:"命令词",ASR:"感应模式",ASRTO:"感应模式"}
+  //{ID:4,keyword:"命令词",ASR:"遥控模式",ASRTO:"遥控模式"}
+  //{ID:5,keyword:"命令词",ASR:"语音模式",ASRTO:"语音模式"}
+  //{ID:6,keyword:"命令词",ASR:"前进",ASRTO:"前进"}
+  //{ID:7,keyword:"命令词",ASR:"后退",ASRTO:"后退"}
+  //{ID:8,keyword:"命令词",ASR:"左转",ASRTO:"左转"}
+  //{ID:9,keyword:"命令词",ASR:"右转",ASRTO:"右转"}
+  //{ID:10,keyword:"命令词",ASR:"停止",ASRTO:"停止"}
+  //{ID:11,keyword:"命令词",ASR:"左电机正转",ASRTO:"左电机正转"}
+  //{ID:12,keyword:"命令词",ASR:"左电机反转",ASRTO:"左电机反转"}
+  //{ID:13,keyword:"命令词",ASR:"左电机停止",ASRTO:"左电机停止"}
+  //{ID:14,keyword:"命令词",ASR:"右电机正转",ASRTO:"右电机正转"}
+  //{ID:15,keyword:"命令词",ASR:"右电机反转",ASRTO:"右电机反转"}
+  //{ID:16,keyword:"命令词",ASR:"右电机停止",ASRTO:"右电机停止"}
+  //{ID:42,keyword:"命令词",ASR:"开始",ASRTO:"开始"}
+  //{ID:43,keyword:"命令词",ASR:"下一步",ASRTO:"下一步"}
+  //{ID:44,keyword:"命令词",ASR:"再来一次",ASRTO:"再来一次"}
+  //{ID:45,keyword:"命令词",ASR:"你好",ASRTO:"你好"}
+  //{ID:46,keyword:"命令词",ASR:"再见",ASRTO:"再见"}
+  //{ID:47,keyword:"命令词",ASR:"谢谢",ASRTO:"谢谢"}
+  //{ID:48,keyword:"命令词",ASR:"打开",ASRTO:"打开"}
+  //{ID:49,keyword:"命令词",ASR:"关闭",ASRTO:"关闭"}
+  //{ID:50,keyword:"命令词",ASR:"组合前进",ASRTO:"组合前进"}
+  //{ID:51,keyword:"命令词",ASR:"组合后退",ASRTO:"组合后退"}
+  //{playid:17,voice:你好呀我是小白进入语音模式}
+  //{playid:18,voice:再见啦，小白去休息了}
+  //{playid:19,voice:动力模式}
+  //{playid:20,voice:感应模式}
+  //{playid:21,voice:遥控模式}
+  //{playid:22,voice:语音模式}
+  //{playid:23,voice:遥控已连接}
+  //{playid:24,voice:遥控已断开}
+  //{playid:25,voice:低电量}
+  //{playid:26,voice:收到}
+  //{playid:27,voice:前进}
+  //{playid:28,voice:后退}
+  //{playid:29,voice:左转}
+  //{playid:30,voice:右转}
+  //{playid:31,voice:停止}
+  //{playid:32,voice:靠近启动}
+  //{playid:33,voice:遇障停止}
+  //{playid:34,voice:挥手开关}
+  //{playid:35,voice:明暗调速}
+  //{playid:36,voice:左电机正转}
+  //{playid:37,voice:左电机反转}
+  //{playid:38,voice:左电机停止}
+  //{playid:39,voice:右电机正转}
+  //{playid:40,voice:右电机反转}
+  //{playid:41,voice:右电机停止}
+  //{playid:52,voice:编程模式}
+  //{playid:53,voice:退出编程模式}
+  //{playid:54,voice:小白开始行动啦}
+  //{playid:55,voice:跟我一起出发吧}
+  //{playid:56,voice:前方道路畅通}
+  //{playid:57,voice:我发现前面有东西}
+  //{playid:58,voice:让我想一想}
+  //{playid:59,voice:小心一点哦}
+  //{playid:60,voice:太棒了，继续加油}
+  //{playid:61,voice:我找到目标啦}
+  //{playid:62,voice:挑战成功}
+  //{playid:63,voice:我的表演结束啦}
+  set_state_enter_wakeup(15000);
+  setPinFun(20,SECOND_FUNCTION);
+  pinMode(20,output);
+  dpmu_set_adio_reuse(PC4,DIGITAL_MODE);
+  setPinFun(4,FIRST_FUNCTION);
+  pinMode(4,output);
+  digitalWrite(20,0);
+}
